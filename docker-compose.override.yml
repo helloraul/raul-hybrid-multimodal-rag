@@ -1,0 +1,9 @@
+# docker-compose.override.yml
+services:
+  app:
+    command: ["uvicorn","src.api:app","--host","0.0.0.0","--port","8000","--proxy-headers"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
