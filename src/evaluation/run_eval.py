@@ -18,7 +18,7 @@ Usage:
 from __future__ import annotations
 import os, sys, csv, json, re, unicodedata, difflib
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from urllib.parse import urlparse, unquote
 from dotenv import load_dotenv
@@ -56,7 +56,7 @@ def parse_args():
     return p.parse_args()
 
 # ---------------- IO helpers ----------------
-def open_text_file(path: Path):
+def open_text_file(path: Path) -> Tuple[Any, str, str]:
     """Return (fh, encoding, delimiter)."""
     raw = path.read_bytes()
     for enc in ("utf-8", "utf-8-sig", "latin-1"):
@@ -117,7 +117,6 @@ def _stem(s: str) -> str:
 def _split_docrefs(cell: str) -> list[str]:
     if not cell:
         return []
-    # allow multi-values split by common separators
     buff = cell.replace("\r", "\n")
     for sep in [";", "|", "\n", ","]:
         if sep in buff:
@@ -125,7 +124,6 @@ def _split_docrefs(cell: str) -> list[str]:
             break
     else:
         parts = [cell.strip()]
-    # unique preserve order
     seen, out = set(), []
     for p in parts:
         if p and p not in seen:
@@ -216,29 +214,113 @@ def resolve_doc_path(docref_cell: str, dataset_dir: Path) -> Optional[Path]:
 
     return None
 
-# ---------------- Loader ----------------
-def detect_mapping(headers: List[str]) -> Dict[str, str]:
+# ---------------- Column picking ----------------
+def _count_nonempty(col_values: List[str]) -> int:
+    cnt = 0
+    for v in col_values:
+        s = str(v or "").strip()
+        if s and s.lower() != "nan":
+            cnt += 1
+    return cnt
+
+def pick_best_column(headers: List[str], rows: List[List[str]], candidates: List[str]) -> Optional[str]:
     """
-    Map our logical fields to actual CSV headers (case-insensitive).
-    We prefer: Question, Source Docs, Answer.
+    Among the provided candidate header names (case-insensitive),
+    return the actual header present in the file with the MOST non-empty values.
+    """
+    lower_to_actual = {h.lower(): h for h in headers}
+    available = [lower_to_actual[c.lower()] for c in candidates if c.lower() in lower_to_actual]
+    if not available:
+        return None
+
+    # Build index map for quick lookups
+    idx = {h: i for i, h in enumerate(headers)}
+
+    best = None
+    best_count = -1
+    for h in available:
+        i = idx[h]
+        col_vals = [row[i] if i < len(row) else "" for row in rows[1:]]  # skip header row
+        c = _count_nonempty(col_vals)
+        if c > best_count:
+            best = h
+            best_count = c
+    return best
+
+def detect_mapping(headers: List[str], rows: List[List[str]]) -> Dict[str, str]:
+    """
+    Prefer the capitalized headers that actually have data:
+      - Question over question
+      - Answer over answer
+      - Source Docs for docref
+    Fall back to lowercase only if the preferred header is missing or empty.
     """
     mapping: Dict[str, str] = {}
     lower = {h.lower(): h for h in headers}
+    idx = {h: i for i, h in enumerate(headers)}
 
-    # Prefer capitalized if present (your file)
-    if "question" in lower: mapping["question"] = lower["question"]
-    if "answer" in lower: mapping["ground_truth"] = lower["answer"]
-    if "source docs" in lower: mapping["docref"] = lower["source docs"]
+    def nonempty_count(h: str) -> int:
+        if h not in idx:
+            return 0
+        col_i = idx[h]
+        cnt = 0
+        for r in rows[1:]:
+            v = (r[col_i] if col_i < len(r) else "").strip()
+            if v and v.lower() != "nan":
+                cnt += 1
+        return cnt
 
-    # fallbacks (rare)
-    if "docref" not in mapping:
-        for cand in ("source_docs", "doc", "document", "filename", "file", "path"):
-            if cand in lower:
-                mapping["docref"] = lower[cand]
-                break
+    # ---- question column
+    q_pref = lower.get("question")  # actual header for capitalized OR lowercase (they both map here)
+    # We want to explicitly check both variants:
+    q_cap = "Question" if "Question" in headers else None
+    q_low = "question" if "question" in headers else None
+
+    if q_cap and nonempty_count(q_cap) > 0:
+        mapping["question"] = q_cap
+    elif q_low and nonempty_count(q_low) > 0:
+        mapping["question"] = q_low
+
+    # ---- ground_truth / answer column
+    a_cap = "Answer" if "Answer" in headers else None
+    a_low = "answer" if "answer" in headers else None
+
+    if a_cap and nonempty_count(a_cap) > 0:
+        mapping["ground_truth"] = a_cap
+    elif a_low and nonempty_count(a_low) > 0:
+        mapping["ground_truth"] = a_low
+
+    # ---- docref column
+    # Prefer "Source Docs", then common fallbacks
+    doc_candidates = [h for h in headers if h.lower() in {
+        "source docs", "sourcedocs", "source_docs",
+        "doc", "document", "filename", "file", "path"
+    }]
+
+    # Prefer exact "Source Docs" if it exists & has data
+    if "Source Docs" in doc_candidates and nonempty_count("Source Docs") > 0:
+        mapping["docref"] = "Source Docs"
+    else:
+        # Otherwise pick the first candidate with data
+        best = None
+        best_cnt = 0
+        for h in doc_candidates:
+            c = nonempty_count(h)
+            if c > best_cnt:
+                best, best_cnt = h, c
+        if best and best_cnt > 0:
+            mapping["docref"] = best
+            
+        if debug:
+            print("📂 Loading questions...")
+            print(" header counts:",
+            {h: sum(1 for r in rows[1:] if (idx[h] < len(r) and str(r[idx[h]]).strip())) for h in headers})
+            print(f"🔎 Detected column mapping: {mapping}")
 
     return mapping
 
+
+# ---------------- Loader ----------------
 def load_questions_table(qfile: Path, dataset_dir: Path, limit: Optional[int]=None, debug: bool=False) -> List[QAItem]:
     fh, enc, delim = open_text_file(qfile)
     rdr = csv.reader(fh, delimiter=delim)
@@ -249,11 +331,12 @@ def load_questions_table(qfile: Path, dataset_dir: Path, limit: Optional[int]=No
         return []
 
     headers = [h.strip() for h in rows[0]]
-    mapping = detect_mapping(headers)
+    mapping = detect_mapping(headers, rows)
     if debug:
         print("📂 Loading questions...")
         print(f"🔎 Detected column mapping: {mapping}")
 
+    # Build header -> position index
     col_idx = {h: i for i, h in enumerate(headers)}
     def col(name: str) -> Optional[int]:
         if name in mapping:
