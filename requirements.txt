@@ -128,3 +128,9 @@ langchain-community
 langchain-openai
 langchain-groq
 langchain-openai
+pytesseract>=0.3.10
+Pillow>=10.0.0
+python-dotenv>=1.0.0
+langgraph>=0.0.36
+openai>=1.10.0
+groq>=0.1.1
