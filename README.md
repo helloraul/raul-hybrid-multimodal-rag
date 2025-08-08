@@ -32,6 +32,11 @@ This project implements a modular Retrieval-Augmented Generation (RAG) pipeline 
 - **Error Handling**
   - Graceful handling of missing `.env` or API keys (OpenAI, Grok)
   - Automatic fallback to demo invoice image if file is missing
+- **Extended Docker Compose Setup**
+  - Add Neo4j, Arize, and any multilingual dependencies as services
+- **Neo4j Integration**
+  - Export structured entities & relationships
+  - Implement `use_neo4j=true` retrieval path in `/ask`
 
 ---
 
@@ -39,17 +44,13 @@ This project implements a modular Retrieval-Augmented Generation (RAG) pipeline 
 - **Retriever Quality Improvements**
   - Enhance BM25 + vector retrieval accuracy for financial PDFs
   - Increase relevant context passed to LLM for better answers
-- **Neo4j Integration**
-  - Export structured entities & relationships
-  - Implement `use_neo4j=true` retrieval path in `/ask`
 - **Multilingual OCR & Query Support**
   - Language detection and translation for queries/documents
 - **Arize Phoenix Observability**
   - Trace RAG pipeline stages, measure LLM latency, and monitor retrieval quality
 - **Evaluation Metrics**
   - Implement Token-F1, answer accuracy, and latency reporting
-- **Extended Docker Compose Setup**
-  - Add Neo4j, Arize, and any multilingual dependencies as services
+- 
 
 
 ---
