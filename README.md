@@ -21,16 +21,37 @@ This project implements a modular Retrieval-Augmented Generation (RAG) pipeline 
   - **Manual Pipeline** – Direct OCR extraction
   - **LangGraph Pipeline** – Orchestrated workflow with OCR + LLM fallback
   - **Agentic Pipeline** – Agent-based reasoning with OCR fallback when LLM confidence is low
+- **FastAPI Service**
+  - `/healthz` and `/llm-ping` endpoints for health checks
+  - `/debug/extract` endpoint to preview document extraction
+  - `/eval` endpoint (BM25 + fallback context)
+  - `/ask` endpoint (BM25 + TF-IDF + guardrails, with citations)
+- **Docker Integration**
+  - Application runs in Docker with `docker-compose`
+  - Dataset mounted via volume mapping (`./SampleDataSet` → `/app/SampleDataSet`)
 - **Error Handling**
   - Graceful handling of missing `.env` or API keys
   - Automatic fallback to demo invoice image if file is missing
+  - “I don’t know” guardrail for unclear or unsupported queries
+
+---
 
 ### 🚧 Pending / Next Steps
-- Neo4j export for structured entity & relationship storage
-- Multilingual OCR & query support (`lang` parameter expansion)
-- Arize Phoenix observability & monitoring integration
-- Basic evaluation metrics (accuracy, latency)
-- Docker Compose setup for reproducible end-to-end runs
+- **Retriever Quality Improvements**
+  - Enhance BM25 + vector retrieval accuracy for financial PDFs
+  - Increase relevant context passed to LLM for better answers
+- **Neo4j Integration**
+  - Export structured entities & relationships
+  - Implement `use_neo4j=true` retrieval path in `/ask`
+- **Multilingual OCR & Query Support**
+  - Language detection and translation for queries/documents
+- **Arize Phoenix Observability**
+  - Trace RAG pipeline stages, measure LLM latency, and monitor retrieval quality
+- **Evaluation Metrics**
+  - Implement Token-F1, answer accuracy, and latency reporting
+- **Extended Docker Compose Setup**
+  - Add Neo4j, Arize, and any multilingual dependencies as services
+
 
 ---
 
@@ -94,10 +115,10 @@ Sample output:
 mathematica
 Copy
 Edit
-✅ Manual Pipeline → Acme Robotics Inc
-✅ LangGraph Pipeline → Acme Robotics Inc.
-✅ Agentic Pipeline → Acme Robotics Inc.
-📄 Note:
+ Manual Pipeline → Acme Robotics Inc
+ LangGraph Pipeline → Acme Robotics Inc.
+ Agentic Pipeline → Acme Robotics Inc.
+ Note:
 
 If examples/demo_invoice.png is missing, the script will generate a sample invoice automatically.
 
@@ -144,3 +165,5 @@ Edit
 
 GROQ_API_KEY=your_groq_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
+
+
