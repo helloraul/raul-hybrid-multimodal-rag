@@ -160,25 +160,55 @@ def langgraph_pipeline(doc_path: str | Path, question: str) -> str:
         pass
     return manual_pipeline(doc_path, question)
 
-def agentic_pipeline_wrapper(doc_path: str | Path, question: str) -> str:
-    """
-    Use your agentic pipeline; if empty, fall back to langgraph -> manual.
-    """
+import os, sys
+from contextlib import contextmanager
+
+@contextmanager
+def _suppress_stdout_stderr():
+    old_out, old_err = sys.stdout, sys.stderr
     try:
-        if openai_api_key or groq_api_key:
-            result = agentic_pipeline(str(doc_path), question)
-            if isinstance(result, dict):
-                answer = (result.get("answer") or "").strip()
-            else:
-                answer = (result or "").strip()
-            if answer and "i don't know" not in answer.lower():
-                return answer
+        with open(os.devnull, "w") as devnull:
+            sys.stdout = devnull
+            sys.stderr = devnull
+            yield
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+
+def _cheap_answer(question: str, context: str) -> str:
+    if not context:
+        return "I don't know."
+    # extremely minimal fallback
+    lines = [ln.strip() for ln in context.splitlines() if ln.strip()]
+    return (lines[0] if lines else "I don't know.")[:400]
+
+def agentic_pipeline_wrapper(doc_path: Path, question: str) -> str:
+    p = Path(doc_path)
+
+    # 1) Try agentic pipeline quietly (suppresses its prints)
+    if (openai_api_key or groq_api_key):
+        try:
+            with _suppress_stdout_stderr():
+                res = agentic_pipeline(str(p), question) or {}
+            ans = (res or {}).get("answer", "") if isinstance(res, dict) else str(res or "")
+            if ans and "i don't know" not in ans.lower():
+                return ans.strip()
+        except Exception:
+            pass
+
+    # 2) Fallback: extract text + your RAG answer if keys exist
+    try:
+        context = _extract_text_any(p)
+        if (openai_api_key or groq_api_key) and context:
+            ans = generate_answer_from_context(context, question) or ""
+            if ans and "i don't know" not in ans.lower():
+                return ans.strip()
     except Exception:
-        # fall through
         pass
-    # fallback chain
-    ans = langgraph_pipeline(doc_path, question)
-    return ans or "I don't know."
+
+    # 3) Last-resort: cheap heuristic
+    context = _extract_text_any(p)
+    return _cheap_answer(question, context)
+
 
 # ---------- Original demo runners (kept intact) ----------
 def run_manual_pipeline():
@@ -229,6 +259,54 @@ def run_agentic_pipeline():
             answer = extract_company_offline(text)
         print(f"✅ Agentic Pipeline → {answer}")
         break
+
+
+from pathlib import Path
+
+def _is_pdf(p: Path) -> bool:
+    return p.suffix.lower() == ".pdf"
+
+def _extract_text_from_pdf(path: Path, max_chars: int = 120_000) -> str:
+    # Try PyMuPDF (best quality)
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(str(path))
+        chunks = []
+        for page in doc:
+            t = page.get_text("text")
+            if t:
+                chunks.append(t)
+            if sum(len(c) for c in chunks) >= max_chars:
+                break
+        return ("\n".join(chunks))[:max_chars]
+    except Exception:
+        pass
+
+    # Fallback: PyPDF2 (OK-ish)
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(str(path))
+        chunks = []
+        for i, pg in enumerate(reader.pages):
+            try:
+                t = pg.extract_text() or ""
+                if t:
+                    chunks.append(t)
+                if sum(len(c) for c in chunks) >= max_chars:
+                    break
+            except Exception:
+                continue
+        return ("\n".join(chunks))[:max_chars]
+    except Exception:
+        pass
+
+    return ""  # if both fail, we’ll return empty and fall back to heuristics
+
+def _extract_text_any(path: Path) -> str:
+    if _is_pdf(path):
+        return _extract_text_from_pdf(path)
+    # non-PDF: use your existing OCR fallback (you already have this)
+    return fallback_ocr_best(path)
 
 # ---------- Entry ----------
 def main():
