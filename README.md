@@ -30,9 +30,8 @@ This project implements a modular Retrieval-Augmented Generation (RAG) pipeline 
   - Application runs in Docker with `docker-compose`
   - Dataset mounted via volume mapping (`./SampleDataSet` → `/app/SampleDataSet`)
 - **Error Handling**
-  - Graceful handling of missing `.env` or API keys
+  - Graceful handling of missing `.env` or API keys (OpenAI, Grok)
   - Automatic fallback to demo invoice image if file is missing
-  - “I don’t know” guardrail for unclear or unsupported queries
 
 ---
 
