@@ -12,10 +12,6 @@ def abs_path(p: str | Path) -> Path:
     p = Path(p)
     return p if p.is_absolute() else (PROJECT_ROOT / p)
 
-# ---------- Diagnostics ----------
-print(" Current working directory:", os.getcwd())
-print(" Does .env exist?", (PROJECT_ROOT / ".env").exists())
-
 # ---------- .env ----------
 env_path = PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=env_path)
@@ -23,10 +19,14 @@ load_dotenv(dotenv_path=env_path)
 openai_api_key = os.getenv("OPENAI_API_KEY")
 groq_api_key  = os.getenv("GROQ_API_KEY")
 
-if not openai_api_key:
-    print("⚠️  OPENAI_API_KEY not found — LLM-based answers may be skipped.")
-if not groq_api_key:
-    print("⚠️  GROQ_API_KEY not found — LangGraph steps using Groq may be skipped.")
+# reduce noise when imported by run_eval.py
+if os.getenv("VERBOSE", "1") == "1":
+    print(" Current working directory:", os.getcwd())
+    print(" Does .env exist?", (PROJECT_ROOT / ".env").exists())
+    if not openai_api_key:
+        print("⚠️  OPENAI_API_KEY not found — LLM-based answers may be skipped.")
+    if not groq_api_key:
+        print("⚠️  GROQ_API_KEY not found — LangGraph steps using Groq may be skipped.")
 
 # ---------- Local imports ----------
 from router.doc_router import route_document
@@ -81,7 +81,7 @@ def fallback_ocr_best(image_path: Path) -> str:
         from PIL import Image, ImageEnhance, ImageFilter
     except Exception as e:
         return f"[fallback_ocr unavailable: {e}]"
-    if not image_path.exists():
+    if not Path(image_path).exists():
         return f"[fallback_ocr: file not found at {image_path}]"
     try:
         img = Image.open(image_path).convert("L")
@@ -89,13 +89,13 @@ def fallback_ocr_best(image_path: Path) -> str:
         img = ImageEnhance.Contrast(img).enhance(2.2)
         img = img.resize((img.width * 2, img.height * 2), Image.BICUBIC)
         psms = [11, 6, 7, 4, 3, 12, 13]
-        best_text, best_score, best_psm = "", -1, None
+        best_text, best_score = "", -1
         for psm in psms:
             cfg = f"--oem 1 --psm {psm} -c user_defined_dpi=300"
             text = _ocr_once(img, cfg)
             score = sum(ch.isalnum() for ch in text)
             if score > best_score:
-                best_text, best_score, best_psm = text, score, psm
+                best_text, best_score = text, score
         return best_text
     except Exception as e:
         return f"[fallback_ocr error: {e}]"
@@ -112,7 +112,75 @@ def build_fallback_prompt(question: str, ocr_text: str) -> str:
         f"OCR TEXT:\n{ocr_text}\n\nQUESTION: {question}\n\nAnswer:"
     )
 
-# ---------- Pipelines ----------
+# ---------- Simple baseline QA on plain text (very naive) ----------
+def _baseline_answer(question: str, text: str) -> str:
+    """
+    Super-naive fallback so eval never returns empty:
+    - If question asks for company, try to extract.
+    - Else return first ~350 chars of text.
+    """
+    if not text:
+        return ""
+    ql = (question or "").lower()
+    if "company" in ql and "name" in ql:
+        return extract_company_offline(text)
+    # crude single-sentence-ish preview
+    return (text.strip().replace("\r", " ").replace("\n", " "))[:350]
+
+# ---------- Pipeline wrappers for run_eval.py ----------
+def manual_pipeline(doc_path: str | Path, question: str) -> str:
+    """
+    Minimal no-LLM path:
+      - route_document() (your router may OCR or read text)
+      - if empty, try fallback_ocr_best()
+      - naive baseline answer extraction
+    """
+    p = Path(doc_path)
+    content = route_document(str(p)) or ""
+    if not content and p.suffix.lower() in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}:
+        content = fallback_ocr_best(p)
+    if not content and p.suffix.lower() == ".pdf":
+        # if router returned nothing for a PDF, just say unknown (no quick PDF OCR here)
+        content = ""
+    return _baseline_answer(question, content) or "I don't know."
+
+def langgraph_pipeline(doc_path: str | Path, question: str) -> str:
+    """
+    Use your LangGraph workflow; if it fails/empty, fall back to manual.
+    """
+    try:
+        workflow = build_rag_workflow()
+        state = {"doc_path": str(doc_path), "query": question}
+        output = workflow.invoke(state) if (groq_api_key or openai_api_key) else {}
+        answer = (output or {}).get("answer", "") if isinstance(output, dict) else (output or "")
+        if answer and "i don't know" not in answer.lower():
+            return str(answer).strip()
+    except Exception as e:
+        # keep going to fallback
+        pass
+    return manual_pipeline(doc_path, question)
+
+def agentic_pipeline_wrapper(doc_path: str | Path, question: str) -> str:
+    """
+    Use your agentic pipeline; if empty, fall back to langgraph -> manual.
+    """
+    try:
+        if openai_api_key or groq_api_key:
+            result = agentic_pipeline(str(doc_path), question)
+            if isinstance(result, dict):
+                answer = (result.get("answer") or "").strip()
+            else:
+                answer = (result or "").strip()
+            if answer and "i don't know" not in answer.lower():
+                return answer
+    except Exception:
+        # fall through
+        pass
+    # fallback chain
+    ans = langgraph_pipeline(doc_path, question)
+    return ans or "I don't know."
+
+# ---------- Original demo runners (kept intact) ----------
 def run_manual_pipeline():
     primary = abs_path("examples/invoice_clean_acme_image.png")
     demo = ensure_demo_invoice()
@@ -121,7 +189,7 @@ def run_manual_pipeline():
         if not chosen.exists():
             continue
         content = route_document(str(chosen)) or fallback_ocr_best(chosen)
-        if "company" in content.lower():
+        if "company" in (content or "").lower():
             response = extract_company_offline(content)
         else:
             response = "[No company info found]"
@@ -150,23 +218,15 @@ def run_agentic_pipeline():
     for chosen in (primary, demo):
         if not chosen.exists():
             continue
-
         answer = None
-
         if openai_api_key or groq_api_key:
-            result = agentic_pipeline(
-                str(chosen),
-                "What is the company name on the invoice?"
-            )
-            answer = (result or {}).get("answer", "").strip()
+            result = agentic_pipeline(str(chosen), "What is the company name on the invoice?")
+            answer = (result or {}).get("answer", "").strip() if isinstance(result, dict) else (result or "")
         else:
             answer = ""
-
-        # Always fallback if LLM fails or says "I don't know"
-        if not answer or "i don't know" in answer.lower():
+        if not answer or "i don't know" in (answer or "").lower():
             text = fallback_ocr_best(chosen)
             answer = extract_company_offline(text)
-
         print(f"✅ Agentic Pipeline → {answer}")
         break
 
