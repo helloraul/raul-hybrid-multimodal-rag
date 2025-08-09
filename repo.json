@@ -1,0 +1,7 @@
+{
+  "question": "Report Apple's total net sales by year/quarter mentioned in the context.",
+  "docref": "*AAPL*",
+  "max_pages": 30,
+  "k_bm25": 12,
+  "k_vec": 12
+}

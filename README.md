@@ -167,3 +167,33 @@ GROQ_API_KEY=your_groq_api_key_here
 OPENAI_API_KEY=your_openai_api_key_here
 
 
+curl -s http://localhost:8000/debug/ask-context \
+  -H "Content-Type: application/json" \
+  --data-binary @req.json | python -m json.tool
+
+Expect: strategy: "probe" and the preview includes “Total net sales”.
+
+curl -s http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  --data-binary @req.json | python -m json.tool
+
+Expect: lines like YYYY Q#: $… and citations in parentheses.
+
+Behavior:
+If BM25/TF-IDF can’t confidently select pages or the LLM is unavailable, the API falls back to a heuristic parser that scans 10-Q text for “Total net sales” near “Three/Nine Months Ended” and returns quarterly totals with file citations.
+
+Smoke test:
+
+graphql
+Copy
+Edit
+make ctx   # or the curl debug command above
+make ask   # should print YYYY Q# totals + citations
+Example output:
+
+bash
+Copy
+Edit
+2022 Q3: $82,959 · $81,434 · $304,182 · $282,457
+2023 Q1: $117,154 · $123,945
+2023 Q2: $94,836 · $97,278 · $211,990 · $221,223 (2022 Q3 AAPL.pdf; 2023 Q1 AAPL.pdf; 2023 Q2 AAPL
