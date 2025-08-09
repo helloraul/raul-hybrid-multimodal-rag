@@ -23,7 +23,7 @@ for p in (PROJECT_ROOT, SRC_DIR):
     if s not in sys.path:
         sys.path.insert(0, s)
 
-# -------------------- helpers from your repo --------------------
+
 from evaluation.run_eval import (
     resolve_doc_paths,
     select_relevant_pages,
@@ -95,7 +95,7 @@ def _snippet(s: str, n: int = 220) -> str:
     return s[:n] + ("..." if len(s) > n else "")
 
 def _extract_text_best_effort(path: Path) -> str:
-    """Try your existing extractor; if empty, fall back to pdftotext -layout."""
+    
     try:
         txt = _extract_text_any(path) or ""
     except Exception:
@@ -110,6 +110,65 @@ def _extract_text_best_effort(path: Path) -> str:
             return out.read_text(errors="ignore")
     except Exception:
         return txt
+    
+import re
+from collections import OrderedDict
+
+_QUARTER_FROM_FILE = re.compile(r"(20\d{2})\s*Q([1-4])", re.I)
+_MONEY = re.compile(r"\$\s*[\d,]+")
+
+def _format_totals_by_period(context: str, citations) -> str:
+    """
+    Parse 'Total net sales' lines from the stitched context and label them by file-derived period.
+    Returns a concise, ordered multiline string.
+    """
+    # Map file -> pretty period label
+    file_period = {}
+    for c in citations:
+        m = _QUARTER_FROM_FILE.search(c.file)
+        if m:
+            file_period[c.file] = f"{m.group(1)} Q{m.group(2)}"
+        else:
+            file_period[c.file] = c.file
+
+    # For each file block, find the nearest 'Total net sales' line and prefer "Three Months Ended"
+    blocks = re.split(r"\n=+\s*FILE:\s*(.+?)\s*(?:\[page.*?\])?\s*=+\n", context)
+    # split leaves: [preamble, file1, body1, file2, body2, ...]
+    out = OrderedDict()
+    for i in range(1, len(blocks), 2):
+        fname = blocks[i].strip()
+        body = blocks[i+1]
+        period = file_period.get(fname, fname)
+
+        # Focus on the section around “Three Months Ended”
+        # Capture a small window to bias toward quarterly figures.
+        snippet = body
+        m_three = re.search(r"Three\s+Months\s+Ended(.{0,800})Total\s+net\s+sales(.{0,200})", body, re.I | re.S)
+        m_any   = re.search(r"Total\s+net\s+sales(.{0,200})", body, re.I | re.S)
+
+        line = None
+        if m_three:
+            window = (m_three.group(0) or "")
+            # pull money tokens from the window
+            monies = _MONEY.findall(window)
+            if monies:
+                line = f"{period}: " + " · ".join(monies[:4])
+        if not line and m_any:
+            window = (m_any.group(0) or "")
+            monies = _MONEY.findall(window)
+            if monies:
+                line = f"{period}: " + " · ".join(monies[:4])
+
+        if line:
+            out[period] = line
+
+    # Order periods chronologically if possible (by year then Q)
+    def _key(p):
+        m = re.match(r"(\d{4})\s+Q([1-4])", p)
+        return (int(m.group(1)), int(m.group(2))) if m else (9999, 9)
+
+    lines = [out[k] for k in sorted(out.keys(), key=_key)]
+    return "\n".join(lines)
 
 @lru_cache(maxsize=64)
 def _extract_doc_text_cached(p: str) -> str:
@@ -356,21 +415,21 @@ def ask_endpoint(req: AskRequest = Body(...)):
 
         if not context.strip():
             return AskResponse(question=req.question, answer="I don't know.", citations=[], context_chars=0)
-        
-        
+
         # --- Heuristic fallback (no LLM) ---
         heur = _extract_total_net_sales(context)
         if heur:
-            # Use the cites you already built in this branch
+            pretty = _format_totals_by_period(context, cites) or None
             used_tail = "; ".join(sorted({c.file if c.page == 0 else f"{c.file} p.{c.page}" for c in cites}))
-            ans = heur if not used_tail else f"{heur} ({used_tail})"
+            ans = (pretty or heur)
+            if used_tail:
+                ans = f"{ans} ({used_tail})"
             return AskResponse(
                 question=req.question,
                 answer=ans,
                 citations=cites,
                 context_chars=len(context),
             )
-
 
         composed_question = f"{RAG_INSTRUCTION}\n\nQuestion: {req.question}"
         try:
@@ -387,6 +446,7 @@ def ask_endpoint(req: AskRequest = Body(...)):
             answer = f"{answer} ({used})"
 
         return AskResponse(question=req.question, answer=answer, citations=cites, context_chars=ctx_len)
+
 
     # ---- 2) Build chunks from BM25 candidates ----
     bm25_chunks: List[Tuple[str, str, str, int]] = []  # (chunk_text, file_name, cite_str, page_idx)
@@ -435,15 +495,23 @@ def ask_endpoint(req: AskRequest = Body(...)):
 
     if not context.strip():
         return AskResponse(question=req.question, answer="I don't know.", citations=[], context_chars=0)
-    
-    
-    
-    # Prepare citations from chosen so the heuristic can return with sources
-    citations_preview = [
+
+    # Build citations list NOW so anything below can use it
+    citations_preview: List[Citation] = [
         Citation(file=f, page=pg + 1, score=sc, kind=kind) for (_t, f, pg, sc, kind) in chosen
     ]
 
-    # --- Heuristic fallback (no LLM) ---
+    # ---- 5.5) Heuristic short-circuit for “Total net sales” (structured) ----
+    pretty = _format_sales_answer(context, citations_preview)
+    if pretty:
+        return AskResponse(
+            question=req.question,
+            answer=pretty,
+            citations=citations_preview,
+            context_chars=len(context),
+        )
+
+    # Optional heuristic (no LLM) if pretty didn’t trigger
     heur = _extract_total_net_sales(context)
     if heur:
         used_tail = "; ".join(sorted({f"{c.file} p.{c.page}" for c in citations_preview}))
@@ -454,7 +522,6 @@ def ask_endpoint(req: AskRequest = Body(...)):
             citations=citations_preview,
             context_chars=len(context),
         )
-
 
     # ---- 6) LLM call ----
     cq = f"{RAG_INSTRUCTION}\n\nQuestion: {req.question}"
@@ -467,9 +534,8 @@ def ask_endpoint(req: AskRequest = Body(...)):
     if not answer or any(s in answer.lower() for s in BAD):
         answer = "I don't know."
 
-    citations: List[Citation] = [
-        Citation(file=f, page=pg + 1, score=sc, kind=kind) for (_t, f, pg, sc, kind) in chosen
-    ]
+    # Reuse the same citations
+    citations = citations_preview
     tail = "; ".join(sorted({f"{c.file} p.{c.page}" for c in citations}))
     if tail and "(" not in answer[-160:]:
         answer = f"{answer} ({tail})"
@@ -624,3 +690,131 @@ def _extract_total_net_sales(context: str) -> Optional[str]:
         out.append(header)
     out.extend(totals[:8])  # keep it concise
     return "\n".join(out) if out else None
+
+
+
+_QUARTER_FROM_FILE = re.compile(r"(20\d{2})\s*Q([1-4])", re.I)
+_MONEY = re.compile(r"\$\s*[\d,]+")
+
+def _format_totals_by_period(context: str, citations) -> str:
+    file_period = {}
+    for c in citations:
+        m = _QUARTER_FROM_FILE.search(c.file)
+        file_period[c.file] = f"{m.group(1)} Q{m.group(2)}" if m else c.file
+
+    blocks = re.split(r"\n=+\s*FILE:\s*(.+?)\s*=+\n", context)
+    out = OrderedDict()
+
+    for i in range(1, len(blocks), 2):
+        fname = blocks[i].strip()
+        body = blocks[i+1]
+        period = file_period.get(fname, fname)
+
+        m_three = re.search(r"Three\s+Months\s+Ended(.{0,800})Total\s+net\s+sales(.{0,200})", body, re.I | re.S)
+        m_any   = re.search(r"Total\s+net\s+sales(.{0,200})", body, re.I | re.S)
+
+        line = None
+        if m_three:
+            monies = _MONEY.findall(m_three.group(0) or "")
+            if monies:
+                line = f"{period}: " + " · ".join(monies[:4])
+        if not line and m_any:
+            monies = _MONEY.findall(m_any.group(0) or "")
+            if monies:
+                line = f"{period}: " + " · ".join(monies[:4])
+
+        if line:
+            out[period] = line
+
+    def _key(p):
+        m = re.match(r"(\d{4})\s+Q([1-4])", p)
+        return (int(m.group(1)), int(m.group(2))) if m else (9999, 9)
+
+    return "\n".join(out[k] for k in sorted(out.keys(), key=_key))
+
+
+
+_DATE_ROW = re.compile(
+    r"(?i)\b(three|nine)\s+months\s+ended\s+([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})"
+)
+# capture “Total net sales … 82,959 … 81,434 … 304,182 … 282,457”
+_SALES_LINE = re.compile(
+    r"(?i)\btotal\s+net\s+sales\b[^\n]*"
+    r"(?:(?:\$|US\$|USD)\s*)?([\d,]+)(?:\s+[\d,]+)?(?:\s+([\d,]+))?(?:\s+([\d,]+))?"
+)
+
+_MONTH_TO_Q = {
+    "jan": "Q1", "feb": "Q1", "mar": "Q1",
+    "apr": "Q2", "may": "Q2", "jun": "Q2",
+    "jul": "Q3", "aug": "Q3", "sep": "Q3",
+    "oct": "Q4", "nov": "Q4", "dec": "Q4",
+}
+
+def _infer_quarter(month_name: str) -> str:
+    m = (month_name or "").strip().lower()[:3]
+    return _MONTH_TO_Q.get(m, "")
+
+def _extract_periods(context: str):
+    """
+    Returns a list of (span_start, span_end, label) found in context for
+    'Three Months Ended <Month> <DD>, <YYYY>' and 'Nine Months Ended ...'
+    """
+    out = []
+    for m in _DATE_ROW.finditer(context or ""):
+        kind = m.group(1).lower()  # three | nine
+        mon = m.group(2)
+        yr  = m.group(4)
+        q = _infer_quarter(mon)
+        label = f"{yr} {q} ({'three' if kind=='three' else 'nine'} months)".strip()
+        out.append((m.start(), m.end(), label))
+    return out
+
+def _closest_period_label(context: str, line_start: int, periods: list) -> str:
+    """
+    Pick the nearest preceding/nearby period label to the sales line.
+    """
+    best = ""
+    best_dist = 1e9
+    for s, e, label in periods:
+        if s <= line_start:
+            dist = line_start - e
+            if 0 <= dist < best_dist and dist < 1200:  # within ~1200 chars above is “nearby”
+                best = label
+                best_dist = dist
+    return best
+
+def _extract_sales_structured(context: str):
+    """
+    Find 'Total net sales' lines and attach the closest period label.
+    Returns list of dicts: {'period': '2022 Q3 (three months)', 'value': '82,959'}
+    Handles lines that include multiple numbers (e.g., three vs nine months) by keeping the first.
+    """
+    results = []
+    periods = _extract_periods(context or "")
+    for m in _SALES_LINE.finditer(context or ""):
+        start = m.start()
+        label = _closest_period_label(context, start, periods)
+        # first captured group is the main value; others are optional extra columns
+        val = next((g for g in m.groups() if g), None)
+        if val:
+            results.append({"period": label or "Unlabeled period", "value": val.replace(",", "")})
+    return results
+
+def _format_sales_answer(context: str, citations) -> str:
+    rows = _extract_sales_structured(context)
+    if not rows:
+        return ""
+    # de-dup by (period,value) keep first seen
+    seen = set()
+    lines = []
+    for r in rows:
+        key = (r["period"], r["value"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"{r['period']}: ${int(r['value']):,}")
+    # source tail
+    tail = "; ".join(sorted({c.file for c in citations}))
+    if tail:
+        lines.append(f"({tail})")
+    return "\n".join(lines)
