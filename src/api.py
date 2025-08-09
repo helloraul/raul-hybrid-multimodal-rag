@@ -291,8 +291,6 @@ def eval_endpoint(req: EvalRequest):
     )
 
 
-
-
 # -------------------- /ask (chat-style) --------------------
 RAG_INSTRUCTION = (
     "You are a precise financial analyst. Use ONLY the provided context to answer the question. "
@@ -358,6 +356,21 @@ def ask_endpoint(req: AskRequest = Body(...)):
 
         if not context.strip():
             return AskResponse(question=req.question, answer="I don't know.", citations=[], context_chars=0)
+        
+        
+        # --- Heuristic fallback (no LLM) ---
+        heur = _extract_total_net_sales(context)
+        if heur:
+            # Use the cites you already built in this branch
+            used_tail = "; ".join(sorted({c.file if c.page == 0 else f"{c.file} p.{c.page}" for c in cites}))
+            ans = heur if not used_tail else f"{heur} ({used_tail})"
+            return AskResponse(
+                question=req.question,
+                answer=ans,
+                citations=cites,
+                context_chars=len(context),
+            )
+
 
         composed_question = f"{RAG_INSTRUCTION}\n\nQuestion: {req.question}"
         try:
@@ -422,6 +435,26 @@ def ask_endpoint(req: AskRequest = Body(...)):
 
     if not context.strip():
         return AskResponse(question=req.question, answer="I don't know.", citations=[], context_chars=0)
+    
+    
+    
+    # Prepare citations from chosen so the heuristic can return with sources
+    citations_preview = [
+        Citation(file=f, page=pg + 1, score=sc, kind=kind) for (_t, f, pg, sc, kind) in chosen
+    ]
+
+    # --- Heuristic fallback (no LLM) ---
+    heur = _extract_total_net_sales(context)
+    if heur:
+        used_tail = "; ".join(sorted({f"{c.file} p.{c.page}" for c in citations_preview}))
+        ans = heur if not used_tail else f"{heur} ({used_tail})"
+        return AskResponse(
+            question=req.question,
+            answer=ans,
+            citations=citations_preview,
+            context_chars=len(context),
+        )
+
 
     # ---- 6) LLM call ----
     cq = f"{RAG_INSTRUCTION}\n\nQuestion: {req.question}"
@@ -462,10 +495,7 @@ def debug_ask_context(req: AskRequest = Body(...), preview_chars: int = 6000):
     if not candidates:
         # 🔎 try probe first
         ctx_probe, probe_cites = _keyword_probe_chunks(
-            docs,
-            per_file_limit=PER_PAGE_CLIP,
-            max_docs=min(8, len(docs)),
-            window=900
+           docs, per_file_limit=PER_PAGE_CLIP,max_docs=min(8, len(docs)),
         )
         if ctx_probe.strip():
             strategy = "probe"
@@ -499,90 +529,98 @@ def debug_ask_context(req: AskRequest = Body(...), preview_chars: int = 6000):
         "citations": cites,
     }
 
-# --- tolerant finance probes (replace your KEY_PROBE) ---
+import re
+
 KEY_PROBE = [
-    r"\bcondensed\W+consolidated\W+(statements?|statement)\W+of\W+operations\b",
-    r"\b(statement|statements?)\W+of\W+operations\b",
-    r"\b(in|amounts?\s+in)\W+millions\b",
-    r"\bnet\W{0,12}sales\b",
-    r"\btotal\W{0,12}net\W{0,12}sales\b",
-    r"\brevenue\w*\b",
-    r"\bsales\W+by\W+(segment|category|geograph\w*)\b",
+    r"\btotal\s+net\s+sales\b",
+    r"\bnet\s+sales\b",
+    r"\brevenue[s]?\b",
+    r"\bby\s+(segment|category|geograph\w+)\b",
+    r"\bin\s+millions\b",
+    r"\b(in|$)\s*USD\b",
 ]
 
 def _keyword_probe_chunks(
     docs: list[Path],
-    *,
-    per_file_limit: int = 2200,
+    per_file_limit: int = 1800,     # a bit larger so we keep more of the table block
     max_docs: int = 6,
-    window: int = 900
+    pre_lines: int = 3,
+    post_lines: int = 6,
 ) -> tuple[str, list[Citation]]:
-    """Probe doc-level text with tolerant regex; extract windows around each hit."""
-    import re
-    pat = re.compile("|".join(KEY_PROBE), flags=re.I | re.DOTALL)
-
-    merged: list[str] = []
-    cites: list[Citation] = []
-    total = 0
-    hits_total = 0
+    """
+    Scan doc-level text for finance keywords and return stitched context with a
+    window of lines around each match so numbers aren't lost.
+    """
+    merged, cites, total = [], [], 0
+    pat = re.compile("|".join(KEY_PROBE), flags=re.I)
 
     for p in docs[:max_docs]:
-        raw = _extract_doc_text_cached(str(p)) or ""
+        raw = _extract_doc_text_cached(str(p))
         if not raw:
             continue
 
-        txt = raw.replace("\u2019", "'")
-        low = txt.lower()
+        # normalize and split into lines
+        lines = [ln.rstrip() for ln in raw.splitlines()]
+        keep_idxs = set()
 
-        windows: list[tuple[int, int]] = []
-        for m in pat.finditer(low):
-            c = m.start()
-            a = max(0, c - window)
-            b = min(len(txt), c + window)
-            windows.append((a, b))
+        # find all matching lines
+        for idx, ln in enumerate(lines):
+            if pat.search(ln):
+                start = max(0, idx - pre_lines)
+                end = min(len(lines), idx + 1 + post_lines)
+                keep_idxs.update(range(start, end))
 
-        # Merge overlapping/nearby windows
-        if windows:
-            windows.sort()
-            merged_spans: list[tuple[int, int]] = []
-            ca, cb = windows[0]
-            for a, b in windows[1:]:
-                if a <= cb + 80:
-                    cb = max(cb, b)
-                else:
-                    merged_spans.append((ca, cb))
-                    ca, cb = a, b
-            merged_spans.append((ca, cb))
-
-            # Stitch windows up to per_file_limit
-            pieces, used = [], 0
-            for a, b in merged_spans:
-                seg = txt[a:b]
-                if used + len(seg) > per_file_limit:
-                    seg = seg[: max(0, per_file_limit - used)]
-                if seg:
-                    pieces.append(seg)
-                    used += len(seg)
-                if used >= per_file_limit:
-                    break
-            piece = "\n".join(pieces)
-            hits_total += len(merged_spans)
+        # build the piece to keep
+        if keep_idxs:
+            ordered = [lines[i] for i in sorted(keep_idxs)]
+            piece = "\n".join(ordered)
         else:
-            # No direct match — try mid-doc slice
-            mid = len(txt) // 2
-            a = max(0, mid - per_file_limit // 2)
-            b = min(len(txt), mid + per_file_limit // 2)
-            piece = txt[a:b]
+            # fallback: mid-doc slice
+            mid = len(raw) // 2
+            piece = raw[max(0, mid - per_file_limit // 2): mid + per_file_limit // 2]
+
+        if len(piece) > per_file_limit:
+            piece = piece[:per_file_limit]
 
         chunk = f"\n\n===== FILE: {p.name} =====\n{piece}"
-        take = chunk if total + len(chunk) <= MAX_CTX else chunk[: MAX_CTX - total]
-        merged.append(take)
-        # label as 'probe' so we know which path produced the text
+        merged.append(chunk)
         cites.append(Citation(file=p.name, page=0, score=0.0, kind="probe"))
-        total += len(take)
+        total += len(chunk)
         if total >= MAX_CTX:
             break
 
-    logger.debug(f"[ASK] keyword-probe windows={hits_total}, ctx_added={total}")
     return "".join(merged), cites
 
+# --- heuristic: pull "Total net sales" lines if present ---
+from typing import Optional  # if not already imported
+import re  # if not already imported at top
+
+def _extract_total_net_sales(context: str) -> Optional[str]:
+    """
+    Cheap parser to surface the 'Total net sales' lines (and nearby numbers)
+    so you return something useful even if the LLM refuses to answer.
+    """
+    if not context:
+        return None
+
+    lines = [ln.strip() for ln in context.splitlines() if ln.strip()]
+    header = ""
+    # Try to capture the period header (e.g., "Three Months Ended ...")
+    for ln in lines[:200]:
+        if re.search(r"(Three|Nine)\s+Months\s+Ended", ln, re.I):
+            header = ln
+            break
+
+    totals = []
+    for ln in lines:
+        if re.search(r"\bTotal\s+net\s+sales\b", ln, re.I):
+            totals.append(ln[:300])
+
+    if not totals:
+        return None
+
+    out = []
+    if header:
+        out.append(header)
+    out.extend(totals[:8])  # keep it concise
+    return "\n".join(out) if out else None
