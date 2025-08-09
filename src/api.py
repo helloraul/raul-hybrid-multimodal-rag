@@ -449,7 +449,7 @@ def ask_endpoint(req: AskRequest = Body(...)):
     )
 
 @app.post("/debug/ask-context")
-def debug_ask_context(req: AskRequest = Body(...)):
+def debug_ask_context(req: AskRequest = Body(...), preview_chars: int = 6000):
     docs = resolve_doc_paths(req.docref, DATASET_DIR)
     q = _tok(req.question)
     candidates = select_relevant_pages(docs, q, max_pages=max(1, req.max_pages))
@@ -493,12 +493,11 @@ def debug_ask_context(req: AskRequest = Body(...)):
 
     context = "".join(merged_parts)
     return {
-        "strategy": strategy,
+        "strategy": "probe" if not candidates else "bm25+tfidf",
         "context_chars": len(context),
-        "context_preview": context[:2000],
+        "context_preview": context[:preview_chars],
         "citations": cites,
     }
-
 
 # --- tolerant finance probes (replace your KEY_PROBE) ---
 KEY_PROBE = [
@@ -586,3 +585,4 @@ def _keyword_probe_chunks(
 
     logger.debug(f"[ASK] keyword-probe windows={hits_total}, ctx_added={total}")
     return "".join(merged), cites
+
