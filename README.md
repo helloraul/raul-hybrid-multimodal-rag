@@ -197,3 +197,35 @@ Edit
 2022 Q3: $82,959 · $81,434 · $304,182 · $282,457
 2023 Q1: $117,154 · $123,945
 2023 Q2: $94,836 · $97,278 · $211,990 · $221,223 (2022 Q3 AAPL.pdf; 2023 Q1 AAPL.pdf; 2023 Q2 AAPL
+
+
+## 📹 Demo Video
+
+Click the image below to watch the demo:
+
+[![Watch the demo](https://img.youtube.com/vi/YOUR_VIDEO_ID/maxresdefault.jpg)](https://youtu.be/YOUR_VIDEO_ID)
+
+---
+
+### 🔹 How to Run Locally
+
+```bash
+# 1. Clone the repo
+git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
+cd YOUR_REPO
+
+# 2. Create virtual environment & install dependencies
+python -m venv venv
+source venv/bin/activate   # macOS / Linux
+venv\Scripts\activate      # Windows
+
+pip install -r requirements.txt
+
+# 3. Start the API server
+uvicorn src.main:app --reload
+
+# 4. Test with example request
+curl -s http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  --data-binary @req.json | python -m json.tool
+
