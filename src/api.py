@@ -547,6 +547,7 @@ def ask_endpoint(req: AskRequest = Body(...)):
         context_chars=len(context),
     )
 
+
 @app.post("/debug/ask-context")
 def debug_ask_context(req: AskRequest = Body(...), preview_chars: int = 6000):
     docs = resolve_doc_paths(req.docref, DATASET_DIR)
@@ -561,7 +562,7 @@ def debug_ask_context(req: AskRequest = Body(...), preview_chars: int = 6000):
     if not candidates:
         # 🔎 try probe first
         ctx_probe, probe_cites = _keyword_probe_chunks(
-           docs, per_file_limit=PER_PAGE_CLIP,max_docs=min(8, len(docs)),
+           docs, per_file_limit=PER_PAGE_CLIP, max_docs=min(8, len(docs)),
         )
         if ctx_probe.strip():
             strategy = "probe"
@@ -583,13 +584,46 @@ def debug_ask_context(req: AskRequest = Body(...), preview_chars: int = 6000):
                 if total >= MAX_CTX:
                     break
     else:
-        # same as before (BM25 → TF-IDF → chosen chunks)
-        ...
-        cites.append({"file": file_name, "page": page_idx + 1, "kind": "bm25/tfidf"})
+        # Build chunks from BM25 candidates (same logic as ask_endpoint)
+        bm25_chunks: List[Tuple[str, str, str, int]] = []
+        for p, i, txt in candidates:
+            raw_txt = (txt or "").strip()
+            if len(raw_txt) < 80:
+                raw_txt = _extract_doc_text_cached(str(p)) or raw_txt
+            ch, cite_str = _build_page_chunk(p, i, raw_txt)
+            bm25_chunks.append((ch, p.name, cite_str, i))
+
+        # TF-IDF over chunks
+        tfidf_rank = _tfidf_over_chunks(q, [(c[0], c[1], c[2]) for c in bm25_chunks], top_k=max(1, req.k_vec))
+        
+        # Merge chunks (dedup by file/page)
+        chosen: List[Tuple[str, str, int, float, str]] = []
+        seen = set()
+
+        # Add BM25 top-k
+        for ch_text, file_name, _cite, page_idx in bm25_chunks[:max(1, req.k_bm25)]:
+            key = (file_name, page_idx)
+            if key in seen:
+                continue
+            seen.add(key)
+            chosen.append((ch_text, file_name, page_idx, 1.0, "bm25"))
+            merged_parts.append(ch_text)
+            cites.append({"file": file_name, "page": page_idx + 1, "kind": "bm25"})
+
+        # Add remaining TF-IDF
+        for (idx, score) in tfidf_rank:
+            ch_text, file_name, _cite, page_idx = bm25_chunks[idx]
+            key = (file_name, page_idx)
+            if key in seen:
+                continue
+            seen.add(key)
+            chosen.append((ch_text, file_name, page_idx, float(score), "tfidf"))
+            merged_parts.append(ch_text)
+            cites.append({"file": file_name, "page": page_idx + 1, "kind": "tfidf"})
 
     context = "".join(merged_parts)
     return {
-        "strategy": "probe" if not candidates else "bm25+tfidf",
+        "strategy": strategy,
         "context_chars": len(context),
         "context_preview": context[:preview_chars],
         "citations": cites,
