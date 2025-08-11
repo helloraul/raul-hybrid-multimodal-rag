@@ -203,7 +203,7 @@ Edit
 
 Click the image below to watch the demo:
 
-[![Watch the demo](https://img.youtube.com/vi/YOUR_VIDEO_ID/maxresdefault.jpg)](https://youtu.be/YOUR_VIDEO_ID)
+[https://youtu.be/YNVVzHwbBiU]
 
 ---
 
@@ -211,8 +211,8 @@ Click the image below to watch the demo:
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/YOUR_USERNAME/YOUR_REPO.git
-cd YOUR_REPO
+git clone https://github.com/helloraul/raul-hybrid-multimodal-rag/YOUR_REPO.git
+cd raul-hybrid-multimodal-rag
 
 # 2. Create virtual environment & install dependencies
 python -m venv venv
