@@ -2,6 +2,31 @@ version: "3.9"
 
 services:
   app:
+    build: .
+    image: raul-hybrid-multimodal-rag-app:0.1.0
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - postgres
+      - neo4j
+
+  redis:
+    image: redis:7.2-alpine
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_PASSWORD: app
+      POSTGRES_USER: app
+      POSTGRES_DB: app
+
+  neo4j:
+    image: neo4j:5.19
+    environment:
+      - NEO4J_AUTH=neo4j/changeme
+  app:
     build:
       context: .
       dockerfile: Dockerfile
